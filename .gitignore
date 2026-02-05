@@ -1,7 +1,2 @@
 __pycache__/
-infer_H0_simulation_for_proposal/data/data.parquet
-infer_H0_simulation_for_proposal/data/h0_interpolators_20_140_100.pickle
-infer_H0_simulation_for_proposal/data/gw_sim_skymap.fits
-infer_H0_simulation_for_proposal/data/small_modeled.parquet
-infer_H0_simulation_for_proposal/data/small_spectro.parquet
-infer_H0_simulation_for_proposal/data/small_fiducial.parquet
+infer_H0_simulation_for_proposal/data/*

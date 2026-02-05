@@ -1,21 +1,8 @@
-from __future__ import division, print_function
-import pandas as pd
 import numpy as np
-from astropy import constants as const
-
+import pandas as pd
 from GWFish.modules.detection import Network
 from GWFish.modules.fishermatrix import compute_network_errors
 import GWFish.modules.waveforms as wf
-
-import bilby
-from gwpy.timeseries import TimeSeries
-from bilby.gw.conversion import component_masses_to_chirp_mass, component_masses_to_symmetric_mass_ratio, luminosity_distance_to_redshift, chirp_mass_and_mass_ratio_to_component_masses
-from bilby.core import utils
-from gwosc import datasets
-import scipy
-from scipy import integrate
-import matplotlib.pyplot as plt
-import logging
 from GWFish.modules.fishermatrix import sky_localization_percentile_factor
 
 ###fisher analysis using GWFish###
@@ -43,7 +30,7 @@ def fisher_analysis_GWfish(param_dict):
    if save_file_path is not None:
       iFIM_file_path = save_file_path
    else:
-      iFIM_file_path = '../data/'
+      iFIM_file_path = './data/'
    # print(f'save file path : {iFIM_file_path}inv_fisher_matrices_{iFIM_file_name}')
    ###############################################
 
