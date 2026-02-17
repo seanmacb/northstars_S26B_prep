@@ -5,7 +5,7 @@ import healpy as hp
 from scipy.stats import norm, multivariate_normal
 from scipy.interpolate import interp1d
 from scipy.special import logsumexp
-from scipy.integrate import trapezoid
+from scipy.integrate import trapezoid, cumulative_trapezoid
 from scipy.interpolate import CubicSpline
 from astropy.io import fits
 from astropy.coordinates import SkyCoord
@@ -18,6 +18,7 @@ import pickle
 from tqdm import tqdm
 import h5py, os
 from run_fisher_analysis import fisher_analysis_GWfish
+from distancetool.find_horizon_range_network_de import calculate_range_from_distancetool
 import time
 import datetime
 from joblib import Parallel, delayed
@@ -30,6 +31,8 @@ pc = const.pc.value #1pc [m]
 ###############
 
 """functions for cosmology calculations"""
+
+"""compute network SNR and sky localization area using GWFish Fisher analysis"""
 def compute_network_SNR_and_sky_area(dL, ra, dec):
     # random_seed = 42
     # bilby.core.utils.random.seed(random_seed)
@@ -57,6 +60,7 @@ def compute_network_SNR_and_sky_area(dL, ra, dec):
     params_df, network_snr, sky_area_deg2_90_list, ra_1sigma_error_list, dec_1sigma_error_list, corr_ra_dec_list, dL_1sigma_error_list = fisher_analysis_GWfish(param_dict)
     return params_df, network_snr, sky_area_deg2_90_list, ra_1sigma_error_list, dec_1sigma_error_list, corr_ra_dec_list, dL_1sigma_error_list
 
+"""main function to compute errors and pick up some events based on the galaxy catalog and cosmological parameters"""
 def compute_errors_and_pick_some_events(gal_cat_df, true_H0, omega_m, mag_cut_r=21, gw_sample_size=100, number_of_events_to_pick=1):
     """filter galaxy catalog by apparent magnitude"""
     galcat_df = gal_cat_df.copy()
@@ -154,6 +158,7 @@ def compute_errors_and_pick_some_events(gal_cat_df, true_H0, omega_m, mag_cut_r=
 
     return filtered_df, skymap_filename_list
 
+"""create a FITS skymap file assuming Gaussian distribution for ra, dec, and dL."""
 def create_fits_skymap_assuming_gaussian(ra_val, dec_val, ra_err, dec_err, corr, dL_val, dL_err, filename="./data/skymap.fits", nside=1024, be_nested=False):
     npix = hp.nside2npix(nside)
     
@@ -240,6 +245,7 @@ def create_fits_skymap_assuming_gaussian(ra_val, dec_val, ra_err, dec_err, corr,
     hdul = fits.HDUList([primary_hdu, hdu])
     hdul.writeto(filename, overwrite=True)
 
+"""fuctions for likelihood calculations"""
 def z_from_dL(dL, H0, Om):
     H0 = H0
     Om0 = Om
@@ -254,8 +260,8 @@ def E(z, Om):
     cosmo = FlatLambdaCDM(H0=70, Om0=Om)
     return 1 / cosmo.efunc(z)
 
-def comoving_distance(z_array, H0, n_points=10):
-    cosmo = FlatLambdaCDM(H0=H0, Om0=O_m)
+def comoving_distance(z_array, H0, Om):
+    cosmo = FlatLambdaCDM(H0=H0, Om0=Om)
     return cosmo.comoving_distance(z_array).value
 
 def luminosity_distance(z_array, H0, Om):
@@ -305,7 +311,7 @@ def create_V_dL_max_GW_interpolated(H0_array):
         result = calculate_range_from_distancetool(m1, m2, network, asdfile_list, pwfile, omega_m, omega_de, omega_k, H0=H0)
         max_range = result[0]
         volume_array.append((4/3) * np.pi * (max_range**3))
-    return scipy.interpolate.CubicSpline(H0_array, volume_array)
+    return CubicSpline(H0_array, volume_array)
     
 def V_dL_GW_max(H0, approx=False):
     """
@@ -338,7 +344,7 @@ def V_dL_GW_max(H0, approx=False):
         volume = H0**(3)
     return volume
 
-def log_likelihood_rapid(z_array, H0, Om, dl_interp, gal_z, gal_zsigma, gal_m, gal_p, gal_distmu, gal_distsig, gal_distnorm, chunk_size=1000):
+def log_likelihood_rapid(z_array, H0, Om, dl_interp, gal_z, gal_zsigma, gal_m, gal_p, gal_distmu, gal_distsig, gal_distnorm, V_dL_GW_max_interpolated, chunk_size=1000):
     
     
     # log_p_rate = np.log(madau(z_array))
@@ -350,6 +356,7 @@ def log_likelihood_rapid(z_array, H0, Om, dl_interp, gal_z, gal_zsigma, gal_m, g
     log_z_step = np.log(z_array[1]-z_array[0])
 
     dl_array = dl_interp(z_array) # shape (N_z,)
+    dl_array = np.maximum(dl_array, 1e-10) # to avoid zero or negative distances
     dL_matrix = dl_array[np.newaxis, :] # shape (1, N_z)
     
     log_integrand_array = np.log((dl_array/(1+z_array))**2 * c*1e-3 / (H0*E(z_array, Om))) # shape (N_z,)
@@ -387,10 +394,7 @@ def log_likelihood_rapid(z_array, H0, Om, dl_interp, gal_z, gal_zsigma, gal_m, g
     total_log_likelihood = logsumexp(np.array(log_likelihood_list)) - log_beta
     return total_log_likelihood
 
-def worker_h0_likelihood(idx, h0_val,  omega_m, interpolator, z_array, masked_gal_measured_z, masked_gal_z_sigma, masked_gal_mr, gal_p, gal_distmu, gal_distsig, gal_distnorm):
-    """
-    1つのH0に対する尤度計算を実行する関数
-    """
+def worker_h0_likelihood(idx, h0_val,  omega_m, interpolator, z_array, masked_gal_measured_z, masked_gal_z_sigma, masked_gal_mr, gal_p, gal_distmu, gal_distsig, gal_distnorm, V_dL_GW_max_interpolated):
     val = log_likelihood_rapid(
         z_array,
         h0_val,
@@ -403,68 +407,24 @@ def worker_h0_likelihood(idx, h0_val,  omega_m, interpolator, z_array, masked_ga
         gal_distmu,
         gal_distsig,
         gal_distnorm,
+        V_dL_GW_max_interpolated,
         chunk_size=2000
     )
     return val
 
-if __name__ == "__main__":
-    start_time = time.time()
+def run_single_simulation(gal_df, H0_array, H0_interpolators, true_H0, omega_m, mag_cut_r, gw_sample_size, number_of_events_to_pick, V_dL_GW_max_interpolated):
 
-    """cosmological parameters used in the simulation"""
-    h = 0.71
-    omega_cdm = 0.1109
-    omega_b = 0.02258
-    n_s = 0.963
-    sigma_8 = 0.8
-    w = -1.0
-
-    omega_m = (omega_cdm + omega_b) / (h ** 2)
-    omega_lambda = 1.0 - omega_m
-    true_H0 = h * 100.0  # in unit of km/s/Mpc
-    print("Cosmological parameters used in the simulation:")
-    print(f"H0: {true_H0} km/s/Mpc")
-    print(f"Omega_m: {omega_m}")
-    print(f"Omega_lambda: {omega_lambda}")
-
-    """load galaxy data"""
-    gal_catalog_path = "./data/small_fiducial.parquet"
-    gal_small_fiducial_df = pd.read_parquet(gal_catalog_path)
-    print('-------columns--------')
-    print(gal_small_fiducial_df.columns)
-    print('catalog num: ' + str(len(gal_small_fiducial_df)))
-
-    """generate GW data and skymap"""
-    mag_cut_r = 21
-    number_of_events_to_pick = 1
-    filtered_df, skymap_filename_list = compute_errors_and_pick_some_events(gal_small_fiducial_df, true_H0=true_H0, omega_m=omega_m, mag_cut_r=mag_cut_r, gw_sample_size=100, number_of_events_to_pick=number_of_events_to_pick)
+    """generate GW data and skymap files"""
+    mag_cut_r = mag_cut_r
+    gw_sample_size = gw_sample_size
+    number_of_events_to_pick = number_of_events_to_pick
+    print('Generating GW data and skymap files...')
+    print(f' gw sample size: {gw_sample_size}')
+    print(f' number of events to pick: {number_of_events_to_pick}')
+    filtered_df, skymap_filename_list = compute_errors_and_pick_some_events(gal_df, true_H0=true_H0, omega_m=omega_m, mag_cut_r=mag_cut_r, gw_sample_size=gw_sample_size, number_of_events_to_pick=number_of_events_to_pick)
     
-    """calculate H0 likelihoods"""
-    """set up H0 array"""
-    h0_array_params = (20, 140, 100) # H0 grid for likelihood eval
-    h0_array = np.linspace(*h0_array_params)
-    
-    """Create array of splines for luminosity distance"""
-    interp_file = './data/h0_interpolators_{}_{}_{}.pickle'.format(*h0_array_params)
-    if os.path.exists(interp_file):
-        with open(interp_file, 'rb') as f:
-            h0_interpolators = pickle.load(f)
-    else:
-        h0_interpolators = []
-        for i in tqdm(range(len(h0_array))):
-            h0_interpolators.append(create_cosmo_interpolator(h0_array[i]))
-        with open(interp_file, 'wb') as f:
-            pickle.dump(h0_interpolators, f)
-    
-    """Create array of splines for V_dL_GW_max if not exist"""
-    interp_file = './data/V_dL_max_GW_interpolated_{}_{}_{}.pickle'.format(*h0_array_params)
-    if os.path.exists(interp_file):
-        with open(interp_file, 'rb') as f:
-            V_dL_GW_max_interpolated = pickle.load(f)
-    else:
-        print('Creating V_dL_GW_max_interpolated...')
-        V_dL_GW_max_interpolated = create_V_dL_max_GW_interpolated(h0_array)
-        with open(interp_file, 'wb') as f:
-            pickle.dump(V_dL_GW_max_interpolated, f)
+    mask = gal_df['mag_true_r_lsst_no_host_extinction'] <= mag_cut_r
+    filtered_df = gal_df.loc[mask]
 
     """load galaxy catalog filtered by apparent magnitude in r band"""
     galaxy_df = filtered_df.copy()
@@ -499,8 +459,8 @@ if __name__ == "__main__":
         # percentile_distance = 1.28155 # 80%
         percentile_distance = 1.64485 # 90%
         # percentile_distance = 1.95996 # 95%
-        gal_dL_for_largest_H0 = luminosity_distance(gal_measured_z, H0=np.max(h0_array), Om=omega_m)
-        gal_dL_for_smallest_H0 = luminosity_distance(gal_measured_z, H0=np.min(h0_array), Om=omega_m)
+        gal_dL_for_largest_H0 = luminosity_distance(gal_measured_z, H0=np.max(H0_array), Om=omega_m)
+        gal_dL_for_smallest_H0 = luminosity_distance(gal_measured_z, H0=np.min(H0_array), Om=omega_m)
         dist_max_thresh = distmu[np.argmax(p)] + percentile_distance * distsig[np.argmax(p)] # for now, all pixels has same dL distribution
         dist_min_thresh = distmu[np.argmax(p)] - percentile_distance * distsig[np.argmax(p)] # for now, all pixels has same dL distribution
         distance_mask = (gal_dL_for_smallest_H0>dist_min_thresh) & (gal_dL_for_largest_H0<dist_max_thresh) # in 90% credible interval
@@ -537,11 +497,11 @@ if __name__ == "__main__":
         """set up redshift array"""
         ### determine z_array maximum ###
         z_array_max_gal = np.max(masked_gal_measured_z + 5*masked_gal_z_sigma) * 1.5
-        z_array_max_GW = z_from_dL(distmu[np.argmax(p)]+5*distsig[np.argmax(p)], H0=np.max(h0_array), Om=omega_m) * 1.5
+        z_array_max_GW = z_from_dL(distmu[np.argmax(p)]+5*distsig[np.argmax(p)], H0=np.max(H0_array), Om=omega_m) * 1.5
         z_array_max = np.max([z_array_max_gal, z_array_max_GW])
 
         ### determine z_array grid size ###
-        min_sigma_GW = z_from_dL(distsig[np.argmax(p)], H0=np.min(h0_array), Om=omega_m)
+        min_sigma_GW = z_from_dL(distsig[np.argmax(p)], H0=np.min(H0_array), Om=omega_m)
         min_sigma_z = np.min(masked_gal_z_sigma)
         dz_required = np.min([min_sigma_GW, min_sigma_z]) / 5
         N_grid = np.max([int(z_array_max / dz_required), 1000])
@@ -551,16 +511,18 @@ if __name__ == "__main__":
 
         """Evaluate H0 likelihood"""
         log_likelihood_list = []
-        core_margin = 2
-        total_cores = os.cpu_count()
-        n_jobs = max(1, total_cores - core_margin)
+        # total_cores = os.cpu_count()
+        # core_margin = 2
+        # n_jobs = max(1, total_cores - core_margin)
+        n_jobs = 7 # total physical cores is 10
         print("Starting parallel likelihood calculation...")
         log_likelihood_list = Parallel(n_jobs=n_jobs)(
             delayed(worker_h0_likelihood)(
-                j, h0_array[j], omega_m, h0_interpolators[j], z_array,
+                j, H0_array[j], omega_m, H0_interpolators[j], z_array,
                 masked_gal_measured_z, masked_gal_z_sigma, masked_gal_mr,
-                gal_p, gal_distmu, gal_distsig, gal_distnorm
-            ) for j in tqdm(range(len(h0_array)))
+                gal_p, gal_distmu, gal_distsig, gal_distnorm,
+                V_dL_GW_max_interpolated
+            ) for j in tqdm(range(len(H0_array)))
         )
         
         log_like = np.array(log_likelihood_list)
@@ -572,6 +534,69 @@ if __name__ == "__main__":
     else:
         total_log_like = log_like_list_all_events[0]
     like = np.exp(total_log_like - logsumexp(total_log_like))
+        
+    return like
+
+if __name__ == "__main__":
+    start_time = time.time()
+
+    """cosmological parameters used in the simulation"""
+    h = 0.71
+    omega_cdm = 0.1109
+    omega_b = 0.02258
+    n_s = 0.963
+    sigma_8 = 0.8
+    w = -1.0
+
+    omega_m = (omega_cdm + omega_b) / (h ** 2)
+    omega_lambda = 1.0 - omega_m
+    true_H0 = h * 100.0  # in unit of km/s/Mpc
+    print("Cosmological parameters used in the simulation:")
+    print(f"H0: {true_H0} km/s/Mpc")
+    print(f"Omega_m: {omega_m}")
+    print(f"Omega_lambda: {omega_lambda}")
+
+    """load galaxy data"""
+    gal_catalog_path = "./data/small_fiducial.parquet"
+    gal_small_fiducial_df = pd.read_parquet(gal_catalog_path)
+    print('-------columns--------')
+    print(gal_small_fiducial_df.columns)
+    print('catalog num: ' + str(len(gal_small_fiducial_df)))
+
+    """set up H0 array"""
+    h0_array_params = (20, 140, 100) # H0 grid for likelihood eval
+    h0_array = np.linspace(*h0_array_params)
+    
+    """Create array of splines for luminosity distance"""
+    interp_file = './data/h0_interpolators_{}_{}_{}.pickle'.format(*h0_array_params)
+    if os.path.exists(interp_file):
+        with open(interp_file, 'rb') as f:
+            h0_interpolators = pickle.load(f)
+    else:
+        h0_interpolators = []
+        for i in tqdm(range(len(h0_array))):
+            h0_interpolators.append(create_cosmo_interpolator(h0_array[i]))
+        with open(interp_file, 'wb') as f:
+            pickle.dump(h0_interpolators, f)
+    
+    """Create array of splines for V_dL_GW_max if not exist"""
+    interp_file = './data/V_dL_max_GW_interpolated_{}_{}_{}.pickle'.format(*h0_array_params)
+    if os.path.exists(interp_file):
+        with open(interp_file, 'rb') as f:
+            V_dL_GW_max_interpolated = pickle.load(f)
+    else:
+        print('Creating V_dL_GW_max_interpolated...')
+        V_dL_GW_max_interpolated = create_V_dL_max_GW_interpolated(h0_array)
+        with open(interp_file, 'wb') as f:
+            pickle.dump(V_dL_GW_max_interpolated, f)
+
+    """run single simulation"""
+    mag_cut_r = 21
+    gw_sample_size = 100
+    number_of_events_to_pick = 1
+    like = run_single_simulation(gal_df=gal_small_fiducial_df, H0_array=h0_array, H0_interpolators=h0_interpolators,
+                                 true_H0=true_H0, omega_m=omega_m, mag_cut_r=mag_cut_r, gw_sample_size=gw_sample_size, number_of_events_to_pick=number_of_events_to_pick, V_dL_GW_max_interpolated=V_dL_GW_max_interpolated
+                                 )
 
     plt.style.use('~/research/my_plot_style.style')
     plt.figure()
@@ -580,8 +605,10 @@ if __name__ == "__main__":
     plt.xlabel(r'$H_0$ [km s$^{-1}$ Mpc$^{-1}$]')
     plt.ylabel('Posterior Density')
     plt.grid(True)
-    plt.show()
-    # plt.savefig(f'./figs/H0_likelihood_mag_cut_r_{mag_cut_r}_event_{len(best_indicies)}.pdf', dpi=200, bbox_inches='tight')
+    # plt.show()
+    save_plot_path = f'./figs/H0_likelihood_mag_cut_r_{mag_cut_r}_better_skyloc_{number_of_events_to_pick}events.pdf'
+    plt.savefig(save_plot_path, dpi=200, bbox_inches='tight')
+    print(f'Saved H0 likelihood figure to {save_plot_path}')
 
     end_time = time.time()
     elapsed = end_time - start_time
