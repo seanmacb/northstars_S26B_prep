@@ -22,6 +22,8 @@ from distancetool.find_horizon_range_network_de import calculate_range_from_dist
 import time
 import datetime
 from joblib import Parallel, delayed
+import sys
+import traceback
 
 ###constants###
 Mo = const.M_sun.value #solar mass [kg]
@@ -31,6 +33,26 @@ pc = const.pc.value #1pc [m]
 ###############
 
 """functions for cosmology calculations"""
+
+"""functions for logging"""
+class Logger(object):
+    def __init__(self, filename="default.log"):
+        self.terminal = sys.stdout
+        self.log = open(filename, 'a')
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        # this flush method is needed for python 3 compatibility.
+        # this handles the flush command, which is called by print().
+        self.terminal.flush()
+        self.log.flush()
+
+    def __getattr__(self, attr):
+        # Delegate other attributes to the original stdout
+        return getattr(self.terminal, attr)
 
 """compute network SNR and sky localization area using GWFish Fisher analysis"""
 def compute_network_SNR_and_sky_area(dL, ra, dec):
@@ -43,8 +65,8 @@ def compute_network_SNR_and_sky_area(dL, ra, dec):
     geocent_time = 1187008882.4  # time of GW170817
     
     param_dict = {
-            'mass_1': 30.0 * np.ones_like(dL), # in source frame
-            'mass_2': 30.0 * np.ones_like(dL), # in source frame
+            'mass_1': 30.0 * np.ones_like(dL),
+            'mass_2': 30.0 * np.ones_like(dL),
             'chi_1': 0.0 * np.ones_like(dL), 'chi_2': 0.0 * np.ones_like(dL),
             'luminosity_distance': dL,
             'geocent_time': geocent_time * np.ones_like(dL),
@@ -61,7 +83,7 @@ def compute_network_SNR_and_sky_area(dL, ra, dec):
     return params_df, network_snr, sky_area_deg2_90_list, ra_1sigma_error_list, dec_1sigma_error_list, corr_ra_dec_list, dL_1sigma_error_list
 
 """main function to compute errors and pick up some events based on the galaxy catalog and cosmological parameters"""
-def compute_errors_and_pick_some_events(gal_cat_df, true_H0, omega_m, mag_cut_r=21, gw_sample_size=100, number_of_events_to_pick=1):
+def compute_errors_and_pick_some_events(gal_cat_df, true_H0, omega_m, mag_cut_r, criteria, threshold, file_name, gw_sample_size=100, number_of_events_to_pick=None, random_seeds=None):
     """filter galaxy catalog by apparent magnitude"""
     galcat_df = gal_cat_df.copy()
 
@@ -69,17 +91,14 @@ def compute_errors_and_pick_some_events(gal_cat_df, true_H0, omega_m, mag_cut_r=
     mask = galcat_df['mag_true_r_lsst_no_host_extinction'] <= mag_cut_r
     filtered_df = galcat_df.loc[mask]
     true_redshifts_masked = galcat_df.loc[mask, 'redshift_true']
-    true_redshifts_range = [np.min(true_redshifts_masked), np.max(true_redshifts_masked)]
-    ra_masked = galcat_df.loc[mask, 'ra_true']
-    dec_masked = galcat_df.loc[mask, 'dec_true']
 
     """sample galaxies from the catalog according to weights"""
     sample_size = gw_sample_size
     weights = np.ones_like(true_redshifts_masked) / len(true_redshifts_masked) # uniform weighting
     # weights = 3.828e26 * 10**(-0.4 * galcat_df.loc[mask, 'Mag_true_r_lsst_z0_no_host_extinction']) / np.sum(3.828e26 * 10**(-0.4 * galcat_df.loc[mask, 'mag_true_r_lsst_no_host_extinction'])) # weighting by luminosity
-    # gal_random_seed = 41
-    # np.random.seed(gal_random_seed)
-    # print(f'random seed for galaxy sampling: {gal_random_seed}')
+    gal_random_seed = random_seeds[1] if random_seeds is not None else np.random.randint(0, 1000000)
+    np.random.seed(gal_random_seed)
+    print(f'random seed for galaxy sampling: {gal_random_seed}')
     sample_indices = np.random.choice(filtered_df.index, size=sample_size, replace=False, p=weights)
     sample_ra = np.array(filtered_df.loc[sample_indices, 'ra_true'])
     sample_dec = np.array(filtered_df.loc[sample_indices, 'dec_true'])
@@ -89,47 +108,62 @@ def compute_errors_and_pick_some_events(gal_cat_df, true_H0, omega_m, mag_cut_r=
     """compute network SNRs and sky localization areas"""
     params_df, network_snr, sky_area_deg2_90_list, ra_1sigma_error_list, dec_1sigma_error_list, corr_ra_dec_list, dL_1sigma_error_list = compute_network_SNR_and_sky_area(sample_true_dL, sample_ra, sample_dec)
 
-    # dL_random_seed = 43
-    # np.random.seed(dL_random_seed)
-    # print(f'ramdom seed for distance measurement error: {dL_random_seed}')
+    dL_random_seed = random_seeds[2] if random_seeds is not None else np.random.randint(0, 1000000)
+    np.random.seed(dL_random_seed)
+    print(f'random seed for distance measurement error: {dL_random_seed}')
     measured_dL = np.random.normal(loc=sample_true_dL, scale=dL_1sigma_error_list) # with error case
     # measured_dL = sample_true_dL # no error case
     # dL_1sigma_error_list = np.ones_like(measured_dL) * 1e-5 # no error case
     negative_mask = measured_dL <= 0
     while np.any(negative_mask):
-        print(f"Resampling {np.sum(negative_mask)} negative distance values...")
+        dL_random_seed += 1
+        np.random.seed(dL_random_seed)
+        print(f"Resampling {np.sum(negative_mask)} negative distance values..., random seed: {dL_random_seed}")
         measured_dL[negative_mask] = np.random.normal(loc=sample_true_dL[negative_mask], scale=dL_1sigma_error_list[negative_mask])
         negative_mask = measured_dL <= 0
 
-    """impose detection threshold"""
-    snr_threshold = 0.0
-    detected_mask = network_snr >= snr_threshold
-    detected_snr = network_snr[detected_mask]
-    print(f"Number of detected events (SNR >= {snr_threshold}): {len(detected_snr)} out of {sample_size} samples.")
-    detected_dL = measured_dL[detected_mask]
-    detected_true_z = sampled_true_z[detected_mask]
-
     """pick up good events"""
+    criteria = criteria
+    number_of_events_to_pick = number_of_events_to_pick
+    threshold = threshold
+
+    dL_error_mask = dL_1sigma_error_list / sample_true_dL < 0.8 # only consider events with less than 80% distance error
+    valid_indices_original = np.where(dL_error_mask)[0]
+    ### impose threshold on sky area ###
+    if criteria == 'impose_threthold_on_sky_area':
+        sky_area_threshold = threshold  # deg^2
+        valid_sky_areas = sky_area_deg2_90_list[valid_indices_original]
+        relative_indices = np.where(valid_sky_areas <= sky_area_threshold)[0]
+        best_indices = valid_indices_original[relative_indices]
+        print(f"\n*** Choose events with sky area smaller than {sky_area_threshold} deg^2***")
+
     ### best snr###
-    # best_index = np.argmax(network_snr)
-    # best_snr = np.max(network_snr)
-    # print(f"Largest detected SNR: {best_snr}")
+    if criteria == 'network_snr':
+        valid_snrs = network_snr[valid_indices_original]
+        relative_indices = np.argsort(valid_snrs)[-number_of_events_to_pick:]
+        best_indices = valid_indices_original[relative_indices]
+        # print(f"\n*** Choose larger SNR events ***")
 
     ### best localization ###
-    # best_index = np.argmin(sky_area_deg2_90_list)
-    best_indices = np.argsort(sky_area_deg2_90_list)[:number_of_events_to_pick]
+    if criteria == 'sky_area_deg2_90':
+        valid_sky_areas = sky_area_deg2_90_list[valid_indices_original]
+        relative_indices = np.argsort(valid_sky_areas)[:number_of_events_to_pick]
+        best_indices = valid_indices_original[relative_indices]
+        print(f"\n*** Choose smaller sky area events ***")
 
     ### fiducial localization ###
-    # fiducial_localization = 10.0  # deg^2
-    # best_index = np.argmin(np.abs(sky_area_deg2_90_list-fiducial_localization))
-    # best_indices = np.argsort(np.abs(sky_area_deg2_90_list-fiducial_localization))[:number_of_events_to_pick]
+    if criteria == 'fiducial_localization':
+        fiducial_localization = 10.0  # deg^2
+        best_indices = np.argsort(np.abs(sky_area_deg2_90_list-fiducial_localization))[:number_of_events_to_pick]
+        print(f"\n*** Choose events with sky area closest to {fiducial_localization} deg^2 ***")
 
+    print(f'\nfile name for this simulation: {file_name}')
+    print(f'\nnumber of GW events: {len(best_indices)}')
     skymap_filename_list = []
     for i, best_index in enumerate(best_indices):
-        print(f"------Event {i+1}--------")
-        best_localization = sky_area_deg2_90_list[best_index]  # pick up closest to 10 deg^2
+        print(f"\n------Event {i+1}--------")
+        best_localization = sky_area_deg2_90_list[best_index]
         print(f"sky area (90% C.I.): {best_localization} deg^2")
-
         print(f"  Corresponding SNR: {network_snr[best_index]}")
         print(f"  Corresponding true and measured dL: {sample_true_dL[best_index]} [Mpc], {measured_dL[best_index]} [Mpc]")
         print(f"  Corresponding dL error: {dL_1sigma_error_list[best_index]} [Mpc], {dL_1sigma_error_list[best_index]/sample_true_dL[best_index]*100:.2f} %")
@@ -143,7 +177,7 @@ def compute_errors_and_pick_some_events(gal_cat_df, true_H0, omega_m, mag_cut_r=
         for key, value in best_injection.items():
             print(f"  {key}: {value}")
 
-        skymap_filename = f"./data/skymap_files/mock_skymap_mag_cut_r_{mag_cut_r}_event_{i+1}.fits"
+        skymap_filename = f"./data/skymap_files/mock_skymap_{file_name}_event_{i+1}.fits"
         target_ra = best_injection['ra']
         target_dec = best_injection['dec']
         target_ra_rad = np.deg2rad(target_ra)
@@ -344,7 +378,7 @@ def V_dL_GW_max(H0, approx=False):
         volume = H0**(3)
     return volume
 
-def log_likelihood_rapid(z_array, H0, Om, dl_interp, gal_z, gal_zsigma, gal_m, gal_p, gal_distmu, gal_distsig, gal_distnorm, V_dL_GW_max_interpolated, chunk_size=1000):
+def log_likelihood_rapid(z_array, H0, Om, dl_interp, gal_z, gal_zsigma, gal_m, gal_p, gal_distmu, gal_distsig, gal_distnorm, V_dL_GW_max_interpolated, alpha_selection_function=None, chunk_size=1000):
     
     
     # log_p_rate = np.log(madau(z_array))
@@ -390,11 +424,15 @@ def log_likelihood_rapid(z_array, H0, Om, dl_interp, gal_z, gal_zsigma, gal_m, g
 
         valid = log_evidence != -np.inf
         log_likelihood_list.append(logsumexp(log_numerator[valid] - log_evidence[valid]))
-    log_beta = np.log(H0**(3)) + np.log(V_dL_GW_max_interpolated(H0))
+    if alpha_selection_function is not None:
+        log_beta = alpha_selection_function * np.log(H0)
+    else:
+        log_beta = np.log(H0**(3)) + np.log(V_dL_GW_max_interpolated(H0))
+        # log_beta = 0. # no selection effect
     total_log_likelihood = logsumexp(np.array(log_likelihood_list)) - log_beta
     return total_log_likelihood
 
-def worker_h0_likelihood(idx, h0_val,  omega_m, interpolator, z_array, masked_gal_measured_z, masked_gal_z_sigma, masked_gal_mr, gal_p, gal_distmu, gal_distsig, gal_distnorm, V_dL_GW_max_interpolated):
+def worker_h0_likelihood(idx, h0_val,  omega_m, interpolator, z_array, masked_gal_measured_z, masked_gal_z_sigma, masked_gal_mr, gal_p, gal_distmu, gal_distsig, gal_distnorm, V_dL_GW_max_interpolated, alpha_selection_function=None):
     val = log_likelihood_rapid(
         z_array,
         h0_val,
@@ -408,24 +446,37 @@ def worker_h0_likelihood(idx, h0_val,  omega_m, interpolator, z_array, masked_ga
         gal_distsig,
         gal_distnorm,
         V_dL_GW_max_interpolated,
-        chunk_size=2000
+        alpha_selection_function=alpha_selection_function,
+        chunk_size=100,
     )
     return val
 
-def run_single_simulation(gal_df, H0_array, H0_interpolators, true_H0, omega_m, mag_cut_r, gw_sample_size, number_of_events_to_pick, V_dL_GW_max_interpolated):
+def run_single_simulation(gal_df, H0_array, H0_interpolators, true_H0, omega_m, mag_cut_r, criteria, threshold, file_name, gw_sample_size, number_of_events_to_pick, V_dL_GW_max_interpolated, alpha_selection_function=None, random_seeds=None):
 
     """generate GW data and skymap files"""
     mag_cut_r = mag_cut_r
+    criteria = criteria
+    threshold = threshold
     gw_sample_size = gw_sample_size
     number_of_events_to_pick = number_of_events_to_pick
     print('Generating GW data and skymap files...')
     print(f' gw sample size: {gw_sample_size}')
+    print(f' criteria for picking events: {criteria}')
+    print(f' threshold for picking events: {threshold}')
     print(f' number of events to pick: {number_of_events_to_pick}')
-    filtered_df, skymap_filename_list = compute_errors_and_pick_some_events(gal_df, true_H0=true_H0, omega_m=omega_m, mag_cut_r=mag_cut_r, gw_sample_size=gw_sample_size, number_of_events_to_pick=number_of_events_to_pick)
+    filtered_df, skymap_filename_list = compute_errors_and_pick_some_events(
+                                                                gal_cat_df=gal_df,
+                                                                true_H0=true_H0,
+                                                                omega_m=omega_m,
+                                                                mag_cut_r=mag_cut_r,
+                                                                criteria=criteria,
+                                                                threshold=threshold,
+                                                                file_name=file_name,
+                                                                gw_sample_size=gw_sample_size,
+                                                                number_of_events_to_pick=number_of_events_to_pick,
+                                                                random_seeds=random_seeds
+                                                                )
     
-    mask = gal_df['mag_true_r_lsst_no_host_extinction'] <= mag_cut_r
-    filtered_df = gal_df.loc[mask]
-
     """load galaxy catalog filtered by apparent magnitude in r band"""
     galaxy_df = filtered_df.copy()
     gal_ra = np.array(galaxy_df['ra_true'][:])
@@ -433,19 +484,11 @@ def run_single_simulation(gal_df, H0_array, H0_interpolators, true_H0, omega_m, 
     gal_mr = np.array(galaxy_df['mag_true_r_lsst_no_host_extinction'][:])
     gal_true_z = np.array(galaxy_df['redshift_true'][:])
     gal_measured_z = np.array(galaxy_df['redshift_measured'][:])
-    gal_z_sigma = np.abs(gal_true_z - gal_measured_z)
-    gal_z_sigma = np.maximum(gal_z_sigma, 0.01)
+    gal_z_sigma = np.array(galaxy_df['redshift_sigma'][:])
 
-    # gal_measured_z_ramdom_seed = 44
-    while np.any(gal_measured_z <= 0):
-        # gal_measured_z_ramdom_seed = gal_measured_z_ramdom_seed + 1
-        # np.random.seed(gal_measured_z_ramdom_seed)
-        # print(f'random seed for measured redshift resampling: {gal_measured_z_ramdom_seed}')
-        mask = gal_measured_z <= 0
-        gal_measured_z[mask] = np.random.normal(gal_true_z[mask], gal_z_sigma[mask])
-    
     log_like_list_all_events = []
-    for i in tqdm(range(number_of_events_to_pick)):
+    for i in tqdm(range(len(skymap_filename_list))):
+        print(f"\nProcessing event {i+1}...")
         GW_sky_map_file_path = skymap_filename_list[i]
 
         """GW data"""
@@ -459,8 +502,9 @@ def run_single_simulation(gal_df, H0_array, H0_interpolators, true_H0, omega_m, 
         # percentile_distance = 1.28155 # 80%
         percentile_distance = 1.64485 # 90%
         # percentile_distance = 1.95996 # 95%
-        gal_dL_for_largest_H0 = luminosity_distance(gal_measured_z, H0=np.max(H0_array), Om=omega_m)
-        gal_dL_for_smallest_H0 = luminosity_distance(gal_measured_z, H0=np.min(H0_array), Om=omega_m)
+        # percentile_distance = 5.0 # 5sigma
+        gal_dL_for_largest_H0 = luminosity_distance(gal_measured_z-percentile_distance*gal_z_sigma, H0=np.max(H0_array), Om=omega_m) # for conservative higher cutoff, gal z is evaluated at lower end of the z distribution, and H0 is evaluated at the largest value
+        gal_dL_for_smallest_H0 = luminosity_distance(gal_measured_z+percentile_distance*gal_z_sigma, H0=np.min(H0_array), Om=omega_m) # for conservative lower cutoff, gal z is evaluated at upper end of the z distribution for lower, and H0 is evaluated at the smallest value
         dist_max_thresh = distmu[np.argmax(p)] + percentile_distance * distsig[np.argmax(p)] # for now, all pixels has same dL distribution
         dist_min_thresh = distmu[np.argmax(p)] - percentile_distance * distsig[np.argmax(p)] # for now, all pixels has same dL distribution
         distance_mask = (gal_dL_for_smallest_H0>dist_min_thresh) & (gal_dL_for_largest_H0<dist_max_thresh) # in 90% credible interval
@@ -496,8 +540,8 @@ def run_single_simulation(gal_df, H0_array, H0_interpolators, true_H0, omega_m, 
 
         """set up redshift array"""
         ### determine z_array maximum ###
-        z_array_max_gal = np.max(masked_gal_measured_z + 5*masked_gal_z_sigma) * 1.5
-        z_array_max_GW = z_from_dL(distmu[np.argmax(p)]+5*distsig[np.argmax(p)], H0=np.max(H0_array), Om=omega_m) * 1.5
+        z_array_max_gal = np.max(masked_gal_measured_z + 5*masked_gal_z_sigma) * 1.1
+        z_array_max_GW = z_from_dL(distmu[np.argmax(p)]+5*distsig[np.argmax(p)], H0=np.max(H0_array), Om=omega_m) * 1.1
         z_array_max = np.max([z_array_max_gal, z_array_max_GW])
 
         ### determine z_array grid size ###
@@ -514,31 +558,56 @@ def run_single_simulation(gal_df, H0_array, H0_interpolators, true_H0, omega_m, 
         # total_cores = os.cpu_count()
         # core_margin = 2
         # n_jobs = max(1, total_cores - core_margin)
-        n_jobs = 7 # total physical cores is 10
+        # n_jobs = 5 # total physical cores is 10
+        n_jobs = 25 # for cluster
         print("Starting parallel likelihood calculation...")
         log_likelihood_list = Parallel(n_jobs=n_jobs)(
             delayed(worker_h0_likelihood)(
                 j, H0_array[j], omega_m, H0_interpolators[j], z_array,
                 masked_gal_measured_z, masked_gal_z_sigma, masked_gal_mr,
                 gal_p, gal_distmu, gal_distsig, gal_distnorm,
-                V_dL_GW_max_interpolated
+                V_dL_GW_max_interpolated, alpha_selection_function=alpha_selection_function
             ) for j in tqdm(range(len(H0_array)))
         )
         
         log_like = np.array(log_likelihood_list)
         log_like_list_all_events.append(log_like)
-
-    """Combine likelihoods from all events"""
-    if number_of_events_to_pick > 1:
-        total_log_like = np.sum(np.array(log_like_list_all_events), axis=0)
-    else:
-        total_log_like = log_like_list_all_events[0]
-    like = np.exp(total_log_like - logsumexp(total_log_like))
-        
-    return like
+    return log_like_list_all_events
 
 if __name__ == "__main__":
     start_time = time.time()
+
+    """parameters for GW data generation and event selection"""
+    mag_cut_r = 21
+    gw_sample_size = 100
+    number_of_events_to_pick = None
+
+    criteria = 'impose_threthold_on_sky_area' # criteria for selection function estimation
+    threshold = 5.0 # deg^2
+    # criteria = 'sky_area_deg2_90' # criteria for selection function estimation
+    # threshold = 80.0 # deg^2
+    # criteria = 'network_snr' # criteria for selection function estimation
+    # threshold = 8.0 # SNR
+
+    deltaz = 0.04 # photometric redshift error
+    # deltaz = 0.0004 # spectroscopic redshift error
+
+    random_seeds = [0, 1, 2] # for gal_z, true GW z, measured dL
+    # random_seeds = [np.random.randint(0, 100) for _ in range(3)]
+    # random_seeds = None
+
+    if number_of_events_to_pick is None:
+        file_name = f'deltaz_{deltaz}_mag_cut_r_{mag_cut_r}_criteria_{criteria}_threshold_{threshold}_random_seed_{random_seeds[0]}-{random_seeds[1]}-{random_seeds[2]}'
+    else:
+        file_name = f'deltaz_{deltaz}_mag_cut_r_{mag_cut_r}_criteria_{criteria}_num_events_{number_of_events_to_pick}_random_seed_{random_seeds[0]}-{random_seeds[1]}-{random_seeds[2]}'
+    
+    """setting log file"""
+    outdir = f"./outdirs/outdir_{file_name}"
+    os.makedirs(outdir, exist_ok=True)
+    log_file = outdir + f"/{file_name}.log"
+    original_stdout = sys.stdout
+    sys.stdout = Logger(log_file)    
+    tqdm.pandas(file=original_stdout)
 
     """cosmological parameters used in the simulation"""
     h = 0.71
@@ -557,11 +626,28 @@ if __name__ == "__main__":
     print(f"Omega_lambda: {omega_lambda}")
 
     """load galaxy data"""
-    gal_catalog_path = "./data/small_fiducial.parquet"
-    gal_small_fiducial_df = pd.read_parquet(gal_catalog_path)
+    # gal_catalog_path = "./data/small_fiducial.parquet"
+    gal_catalog_path = "./data/large_sim_gal_cat.parquet"
+    gal_catalog_df = pd.read_parquet(gal_catalog_path)
     print('-------columns--------')
-    print(gal_small_fiducial_df.columns)
-    print('catalog num: ' + str(len(gal_small_fiducial_df)))
+    print(gal_catalog_df.columns)
+    print('catalog num: ' + str(len(gal_catalog_df)))
+
+    """set delta z"""
+    deltaz = deltaz
+    gal_z_sigma = deltaz * (1 + gal_catalog_df['redshift_true'])
+    gal_measured_z_ramdom_seed = random_seeds[0] if not random_seeds is None else np.random.randint(0, 10000)
+    np.random.seed(gal_measured_z_ramdom_seed)
+    print(f'random seed for measured redshift: {gal_measured_z_ramdom_seed}')
+    gal_catalog_df['redshift_measured'] = np.random.normal(gal_catalog_df['redshift_true'], gal_z_sigma)
+    gal_catalog_df['redshift_sigma'] = gal_z_sigma
+
+    while np.any(gal_catalog_df['redshift_measured'] <= 0):
+        gal_measured_z_ramdom_seed = gal_measured_z_ramdom_seed + 1
+        np.random.seed(gal_measured_z_ramdom_seed)
+        print(f'random seed for measured redshift resampling: {gal_measured_z_ramdom_seed}')
+        mask = gal_catalog_df['redshift_measured'] <= 0
+        gal_catalog_df.loc[mask, 'redshift_measured'] = np.random.normal(gal_catalog_df.loc[mask, 'redshift_true'], gal_catalog_df.loc[mask, 'redshift_sigma'])
 
     """set up H0 array"""
     h0_array_params = (20, 140, 100) # H0 grid for likelihood eval
@@ -590,14 +676,56 @@ if __name__ == "__main__":
         with open(interp_file, 'wb') as f:
             pickle.dump(V_dL_GW_max_interpolated, f)
 
-    """run single simulation"""
-    mag_cut_r = 21
-    gw_sample_size = 100
-    number_of_events_to_pick = 1
-    like = run_single_simulation(gal_df=gal_small_fiducial_df, H0_array=h0_array, H0_interpolators=h0_interpolators,
-                                 true_H0=true_H0, omega_m=omega_m, mag_cut_r=mag_cut_r, gw_sample_size=gw_sample_size, number_of_events_to_pick=number_of_events_to_pick, V_dL_GW_max_interpolated=V_dL_GW_max_interpolated
-                                 )
+    """Calculate selection function from injections"""
+    h0_array_for_selection_function = np.arange(20, 140, 1)
+    p_det_array = np.zeros(len(h0_array_for_selection_function))
+    print('\nCalculating selection function from injections...')
+    for i in tqdm(range(len(h0_array_for_selection_function))):
+        injection_file_path = f'./data/injections/injection_10000_magcut_{mag_cut_r}_H0_{h0_array_for_selection_function[i]:.3f}_for_selection_function.h5'
+        with h5py.File(injection_file_path, 'r') as f:
+            if criteria == 'sky_area_deg2_90' or criteria == 'impose_threthold_on_sky_area':
+                val_array = f['sky_area_deg2_90'][:]
+                selected_mask = val_array <= threshold
+            if criteria == 'network_snr':
+                val_array = f['network_snr'][:]
+                selected_mask = val_array >= threshold
+        p_det = np.sum(selected_mask) / len(val_array)
+        p_det_array[i] = p_det
+    x = h0_array_for_selection_function
+    y = p_det_array
+    mask = (x > 0) & (y > 0)
+    logx = np.log(x[mask])
+    logy = np.log(y[mask])
+    alpha, logA = np.polyfit(logx, logy, 1)
+    A = np.exp(logA)
+    p_det_fit = A * x**alpha
 
+    """run single simulation"""
+    log_like_list_all_events = run_single_simulation(
+                                gal_df=gal_catalog_df, 
+                                H0_array=h0_array,
+                                H0_interpolators=h0_interpolators,
+                                true_H0=true_H0,
+                                omega_m=omega_m, 
+                                mag_cut_r=mag_cut_r,
+                                criteria=criteria,
+                                threshold=threshold,
+                                file_name=file_name,
+                                gw_sample_size=gw_sample_size,
+                                number_of_events_to_pick=number_of_events_to_pick,
+                                V_dL_GW_max_interpolated=V_dL_GW_max_interpolated,
+                                alpha_selection_function=alpha,
+                                random_seeds=random_seeds
+                                )
+    
+    """Combine likelihoods from all events"""
+    if len(log_like_list_all_events) > 1:
+        total_log_like = np.sum(np.array(log_like_list_all_events), axis=0)
+    else:
+        total_log_like = log_like_list_all_events[0]
+    like = np.exp(total_log_like - logsumexp(total_log_like))
+
+    """Plot H0 likelihood"""
     plt.style.use('~/research/my_plot_style.style')
     plt.figure()
     plt.plot(h0_array, like, color='blue', lw=2, marker='o')
@@ -606,9 +734,18 @@ if __name__ == "__main__":
     plt.ylabel('Posterior Density')
     plt.grid(True)
     # plt.show()
-    save_plot_path = f'./figs/H0_likelihood_mag_cut_r_{mag_cut_r}_better_skyloc_{number_of_events_to_pick}events.pdf'
+    # save_plot_path = f'./figs/H0_likelihood_mag_cut_r_{mag_cut_r}_criteria_{criteria}_{number_of_events_to_pick}events_dL_error<0.8_alpha_{alpha:.2f}_v5.pdf'
+    save_plot_path = f'{outdir}/H0_likelihood_{file_name}.pdf'
     plt.savefig(save_plot_path, dpi=200, bbox_inches='tight')
     print(f'Saved H0 likelihood figure to {save_plot_path}')
+
+    """Save likelihood data to file"""
+    output_file = f"{outdir}/likelihood_{file_name}.h5"
+    with h5py.File(output_file, 'w') as f:
+        f.create_dataset('H0', data=h0_array, dtype='f4', compression='gzip')
+        f.create_dataset('likelihood', data=like, dtype='f4', compression='gzip')
+        f.create_dataset('log_likelihood_all_events', data=log_like_list_all_events, dtype='f4', compression='gzip')
+    print(f'Saved likelihood data to {output_file}')
 
     end_time = time.time()
     elapsed = end_time - start_time

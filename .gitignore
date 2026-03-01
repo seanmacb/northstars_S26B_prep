@@ -1,2 +1,6 @@
 __pycache__/
 infer_H0_simulation_for_proposal/data/*
+infer_H0_simulation_for_proposal/log_files/*
+infer_H0_simulation_for_proposal/figs/*
+infer_H0_simulation_for_proposal/outdirs/*
+

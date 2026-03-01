@@ -1,0 +1,23 @@
+universe = vanilla
+executable = run_create_injection.sh
+
+transfer_input_files = create_injection_by_fisher.py
+request_memory = 209370
+request_cpus = 64
+
+log = ./log_files/out.log
+error = ./log_files/out_injection_$(cluster)_$$([$(Process)+$(index)]).err
+output = ./log_files/out_injection_$(cluster)_$$([$(Process)+$(index)]).out
+
+
+notification = never
+
+index = 0
+queue 1
+# queue index from(
+#     0,
+#     1,
+#     2,
+#     3,
+#     4
+# )
