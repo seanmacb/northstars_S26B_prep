@@ -15,6 +15,7 @@ from scipy.interpolate import interp1d
 from scipy.integrate import cumulative_trapezoid
 from scipy.stats import kstest, beta
 import h5py
+import sys
 
 def calculate_p_val_from_likelihood(likelihood_array, h0_array, true_h0):
     cdf = cumulative_trapezoid(likelihood_array, h0_array, initial=0)
